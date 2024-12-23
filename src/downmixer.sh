@@ -16,7 +16,7 @@ set +e
 # -filter:a:3 "pan=stereo|c0=0.5*c2+0.707*c0+0.707*c4+0.5*c3|c1=0.5*c2+0.707*c1+0.707*c5+0.5*c3"
 # output.mkv
 
-CHANNEL_5_1=("channel_layout=5.1" "channel_layout=5.1(side)")
+CHANNEL_5_1=("channel_layout=5.1" "channel_layout=5.1(side)" "channel_layout=6.1" "channel_layout=7.1")
 CHANNEL_STEREO="channel_layout=stereo"
 
 # List of popular containers
@@ -41,10 +41,11 @@ DOWNMIX_ROBERT_COLLIER="pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5"
 DONT_DOWNMIX="N/A"
 
 inputFile="$1"
+languageFilter="${2:-.}"
 outputFile="downmixed-$1"
 
 # Base ffmpeg args for copying all video, subtitle, and ttf streams
-FFMPEG_BASE_ARGS="-i $inputFile -map 0:v -c:v copy -map 0:s -c:s copy -map 0:t -c:t copy"
+FFMPEG_BASE_ARGS="-i $inputFile -tune fastdecode -keyint_min 30 -map 0:v -c:v copy -map 0:s -c:s copy -map 0:t? -c:t copy -nostdin"
 
 # Prefixes for information gathered from ffprobe commands
 STREAM_INDEX_PREFIX="index="
@@ -54,25 +55,25 @@ LANGUAGE_PREFIX="tag:language="
 
 # Helper function to check if element exists in array
 containsElement () {
-	local e match="$1"
-	shift
-	for e; do [[ "$e" == "$match" ]] && return 0; done
-	return 1
+        local e match="$1"
+        shift
+        for e; do [[ "$e" == "$match" ]] && return 0; done
+        return 1
 }
 
 # Helper function to check if file is supported type
 supportedFile () {
-	for ext in "${MEDIA_CONTAINERS[@]}"; do
-		if [[ "$inputFile" == "*.$ext" ]]; then
-			return 1
-		fi
-	done
-	return 0
+        for ext in "${MEDIA_CONTAINERS[@]}"; do
+                if [[ "$inputFile" == "*.$ext" ]]; then
+                        return 1
+                fi
+        done
+        return 0
 }
 
 if ! supportedFile; then
-	echo "unsupported file type"
-	exit
+        echo "unsupported file type"
+        exit
 fi
 
 # Use ffprobe to get audio stream information from file
@@ -94,99 +95,103 @@ typeset -i audioOutputIndex
 
 # Parse each audio stream to find highest quality 5.1 to downmix for each language
 while IFS= read -r line; do
-	# Extract relevant information
-	streamIndex=$(echo "$line" | awk -F '|' '{print $2}')
-	streamIndex="${streamIndex:${#STREAM_INDEX_PREFIX}}"
-	codec=$(echo "$line" | awk -F '|' '{print $3}')
-	codec="${codec:${#CODEC_PREFIX}}"
-	sampleRate=$(echo "$line" | awk -F '|' '{print $5}')
-	sampleRate="${sampleRate:${#SAMPLE_RATE_PREFIX}}"
-	channel_layout=$(echo "$line" | awk -F '|' '{print $6}')
-	language=$(echo "$line" | awk -F '|' '{print $7}')
-	language="${language}:${#LANGUAGE_PREFIX}}"
+        # Extract relevant information
+        streamIndex=$(echo "$line" | awk -F '|' '{print $2}')
+        streamIndex="${streamIndex:${#STREAM_INDEX_PREFIX}}"
+        codec=$(echo "$line" | awk -F '|' '{print $3}')
+        codec="${codec:${#CODEC_PREFIX}}"
+        sampleRate=$(echo "$line" | awk -F '|' '{print $5}')
+        sampleRate="${sampleRate:${#SAMPLE_RATE_PREFIX}}"
+        channel_layout=$(echo "$line" | awk -F '|' '{print $6}')
+        language=$(echo "$line" | awk -F '|' '{print $7}')
+        language="${language}:${#LANGUAGE_PREFIX}}"
 
-	# Add args for copying current audio stream as is to preserve original
-	ffmpegCopyArgs=" -map 0:$streamIndex -c:a:$audioOutputIndex copy"
-	ffmpegCommand+="$ffmpegCopyArgs"
-	audioOutputIndex+=1
+        # Add args for copying current audio stream as is to preserve original
+        ffmpegCopyArgs=" -map 0:$streamIndex -c:a:$audioOutputIndex copy"
+        ffmpegCommand+="$ffmpegCopyArgs"
+        audioOutputIndex+=1
 
-	if [[ "$channel_layout" == "$CHANNEL_STEREO" ]]; then
-		echo "stream is stereo. should not downmix for this language"
-		streamInfo["$language"]="$DONT_DOWNMIX"
-		continue
-	fi
+        if [[ "$channel_layout" == "$CHANNEL_STEREO" ]]; then
+                echo "stream is stereo. should not downmix for this language"
+                #streamInfo["$language"]="$DONT_DOWNMIX"
+                continue
+        fi
 
-	if ! containsElement "$channel_layout" "${CHANNEL_5_1[@]}"; then
-		echo "not 5.1 audio stream. don't do anything"
-		continue
-	fi
+        if ! containsElement "$channel_layout" "${CHANNEL_5_1[@]}"; then
+                echo "not 5.1 audio stream. don't do anything ($channel_layout)"
+                continue
+        fi
 
-	# Check if current audio stream has 5.1 channel layout
-	echo "stream is 5.1 should try to downmix"
-	if [[ ${streamInfo["$language"]} == "$DONT_DOWNMIX" ]]; then
-		# Check if don't downmix has been set already. Means there is already stereo audio
-		echo "has stereo audio for language and should not downmix"
-		continue
-	fi
+        # Check if current audio stream has 5.1 channel layout
+        echo "stream is 5.1 should try to downmix"
+        if [[ ${streamInfo["$language"]} == "$DONT_DOWNMIX" ]]; then
+                # Check if don't downmix has been set already. Means there is already stereo audio
+                echo "has stereo audio for language and should not downmix"
+                continue
+        fi
 
-	# Should downmix
-	# Check if codec is lossless or lossy
-	# We are assuming that the lossless codec audioStreams are higher quality and haven't been lossily converted in the past
-	losslessness=""
-	if containsElement "$codec" "${LOSSLESS_AUDIO_CODECS[@]}"; then
-		# Is a lossless codec
-		echo "lossless codec"
-		losslessness="lossless"
-	elif containsElement "$codec" "${LOSSY_AUDIO_CODECS[@]}"; then
-		# Is a lossy codec
-		echo "lossy codec"
-		losslessness="lossy"
-	else
-		# Is an unsupported codec
-		echo "unsupported codec for downmixing"
-		continue
-	fi
+        # ingore languages if filtered
+        echo "$language" | grep -E "$languageFilter" || continue
 
-	# Shortened info used for comparisons to find highest quality stream
-	shortenedInfo="$streamIndex|$losslessness|$sampleRate"
+        # Should downmix
+        # Check if codec is lossless or lossy
+        # We are assuming that the lossless codec audioStreams are higher quality and haven't been lossily converted in the past
+        losslessness=""
+        if containsElement "$codec" "${LOSSLESS_AUDIO_CODECS[@]}"; then
+                # Is a lossless codec
+                echo "lossless codec"
+                losslessness="lossless"
+        elif containsElement "$codec" "${LOSSY_AUDIO_CODECS[@]}"; then
+                # Is a lossy codec
+                echo "lossy codec"
+                losslessness="lossy"
+        else
+                # Is an unsupported codec
+                echo "unsupported codec for downmixing"
+                continue
+        fi
 
-	# Check if we've seen this language before
-	if [[ -z "${streamInfo[$LANGUAGE]}" ]]; then
-		# Is a language we haven't seen before. Add it to the map
-		echo "new language detected: $language"
-		streamInfo["$language"]="$shortenedInfo"
-		continue
-	fi
+        # Shortened info used for comparisons to find highest quality stream
+        shortenedInfo="$streamIndex|$losslessness|$sampleRate"
 
-	# Is a language we have seen before. Need to compare streams for better downmixing source
-	echo "language already exists"
-	existingInfo=${streamInfo["$language"]}
-	existingLosslessness=$(echo "$existingInfo" | awk -F '|' '{print $2}')
-	existingSampleRate=$(echo "$existingInfo" | awk -F '|' '{print $3}')
+        # Check if we've seen this language before
+        if [[ -z "${streamInfo[$language]}" ]]; then
+                # Is a language we haven't seen before. Add it to the map
+                echo "new language detected: $language"
+                streamInfo["$language"]="$shortenedInfo"
+                #continue
+        fi
+        streamInfo["$language"]="$shortenedInfo"
 
-	# Compare quality (based on metadata) of audioStreams to see if new stream is better than existing stream
-	if [ "$losslessness" == "lossy" ] && [ "$existingLosslessness" == "lossless" ]; then
-		# Already lossless source and current stream is lossy, so do nothing
-		echo "already has higher lossless codec"
-		continue
-	elif [ "$losslessness" == "lossless" ] && [ "$existingLosslessness" == "lossy" ]; then
-		# Replace stream to downmix with lossless source stream
-		echo "replacing with lossless version"
-		streamInfo["$language"]="$shortenedInfo"
-		continue
-	fi
+        # Is a language we have seen before. Need to compare streams for better downmixing source
+        echo "language already exists"
+        existingInfo=${streamInfo["$language"]}
+        existingLosslessness=$(echo "$existingInfo" | awk -F '|' '{print $2}')
+        existingSampleRate=$(echo "$existingInfo" | awk -F '|' '{print $3}')
 
-	# Both are same losslessness. Compare sample rate
-	echo "both same losslessness"
-	if [[ "sampleRate" -le "$existingSampleRate" ]]; then
-		# Compare samplerate for higher sample rate
-		echo "sample rate lower or same... nothing to do"
-		continue
-	fi
+        # Compare quality (based on metadata) of audioStreams to see if new stream is better than existing stream
+        if [ "$losslessness" == "lossy" ] && [ "$existingLosslessness" == "lossless" ]; then
+                # Already lossless source and current stream is lossy, so do nothing
+                echo "already has higher lossless codec"
+                continue
+        elif [ "$losslessness" == "lossless" ] && [ "$existingLosslessness" == "lossy" ]; then
+                # Replace stream to downmix with lossless source stream
+                echo "replacing with lossless version"
+                streamInfo["$language"]="$shortenedInfo"
+                continue
+        fi
 
-	# Replace stream to downmix with higher quality source stream
-	echo "replacing with higher sample rate"
-	streamInfo["$language"]="$shortenedInfo"
+        # Both are same losslessness. Compare sample rate
+        echo "both same losslessness"
+        if [[ "sampleRate" -le "$existingSampleRate" ]]; then
+                # Compare samplerate for higher sample rate
+                echo "sample rate lower or same... nothing to do"
+                continue
+        fi
+
+        # Replace stream to downmix with higher quality source stream
+        echo "replacing with higher sample rate"
+        streamInfo["$language"]="$shortenedInfo"
 
 done <<< "$audioStreams"
 
@@ -196,28 +201,30 @@ echo "${streamInfo[@]}"
 downmixStreamCount=0
 
 for key in "${!streamInfo[@]}"; do
-	# Attempt do downmix chosen streams for each unique language audio stream
-	echo "${key}, ${streamInfo[${key}]}"
+        # Attempt do downmix chosen streams for each unique language audio stream
+        echo "${key}, ${streamInfo[${key}]}"
 
-	info=${streamInfo["$key"]}
-	if [[ "$info" == "$DONT_DOWNMIX" ]]; then
-		# Don't do anything if language marked as don't downmix
-		continue
-	fi
+        info=${streamInfo["$key"]}
+        if [[ "$info" == "$DONT_DOWNMIX" ]]; then
+                # Don't do anything if language marked as don't downmix
+                continue
+        fi
 
-	index=$(echo "$info" | awk -F '|' '{print $1}')
+        index=$(echo "$info" | awk -F '|' '{print $1}')
 
-	ffmpegDownmixArgs=" -map 0:$index -filter:a:$audioOutputIndex $downmixFunction"
-	ffmpegCommand+="$ffmpegDownmixArgs"
-	audioOutputIndex+=1
-	downmixStreamCount+=1
+        ffmpegDownmixArgs=" -map 0:$index -filter:a:$audioOutputIndex $downmixFunction -c:a:$audioOutputIndex ac3"
+        ffmpegCommand+="$ffmpegDownmixArgs"
+        audioOutputIndex+=1
+        downmixStreamCount+=1
 done
 
 if [[ "$downmixStreamCount" == 0 ]]; then
-	echo "no downmixing required"
-	exit
+        echo "no downmixing required"
+        exit
 fi
 
 ffmpegCommand="ffmpeg $ffmpegCommand $outputFile"
 echo "downmixing..."
-eval "$($ffmpegCommand)"
+echo "ffmpeg command: $ffmpegCommand"
+eval "$($ffmpegCommand)" | exit $?
+mv -v "$outputFile" "$inputFile"
